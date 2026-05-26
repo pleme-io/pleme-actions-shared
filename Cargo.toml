@@ -1,6 +1,6 @@
 [package]
 name = "pleme-actions-shared"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.89.0"
 description = "Shared toolkit for pleme-io GitHub Actions — typed input/output, step-summary builder, structured logging, GitHub-annotation error format. Every pleme-io action's binary depends on this crate."
