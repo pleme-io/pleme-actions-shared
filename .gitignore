@@ -4,3 +4,4 @@
 *.swp
 .direnv
 .envrc.local
+Cargo.build-spec.json
