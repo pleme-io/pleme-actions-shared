@@ -142,8 +142,23 @@ fn parse_scalar(s: &str) -> serde_json::Value {
         "false" => return serde_json::Value::Bool(false),
         _ => {}
     }
+    // ── ★ ONLY CANONICAL DECIMALS BECOME NUMBERS ─────────────────────────
+    // `"0042".parse::<i64>()` succeeds and yields 42, which is a DIFFERENT
+    // IDENTIFIER than the one the operator typed. Round-tripping through
+    // Display and requiring the text back tells the two apart: a genuine
+    // number is unchanged, a zero-padded or `+`-prefixed one is not, and only
+    // the former is safe to retype.
+    //
+    // This keeps the ergonomics the coercion exists for — a catalog input
+    // declared `r#type: int` still arrives as a number — while refusing to
+    // renumber an identifier that merely looks numeric. Padded ids are common
+    // enough (zero-padded run numbers, some issue keys) that the silent case
+    // is worth closing rather than documenting.
     if let Ok(n) = s.parse::<i64>() {
-        return serde_json::Value::Number(n.into());
+        if n.to_string() == s {
+            return serde_json::Value::Number(n.into());
+        }
+        return serde_json::Value::String(s.to_string());
     }
     if let Ok(f) = s.parse::<f64>() {
         if let Some(n) = serde_json::Number::from_f64(f) {
@@ -300,5 +315,131 @@ mod tests {
             parse_scalar("{invalid"),
             serde_json::Value::String("{invalid".into())
         );
+    }
+}
+
+/// Deserializers for inputs whose *text* matters even when it looks like
+/// something else.
+///
+/// ── ★ WHY THIS EXISTS ─────────────────────────────────────────────────
+/// [`parse_scalar`] deliberately types scalars by shape: `"true"` becomes a
+/// bool and `"4683416"` becomes a number, so an action declaring
+/// `r#type: bool` in the catalog can consume a `bool` in Rust with no manual
+/// coercion. That ergonomics win is real and stays.
+///
+/// It has one sharp edge, and it is invisible until it fires: a `String`
+/// field whose value happens to be all digits no longer deserializes.
+/// Measured 2026-08-23 — `github-app-installation-token` failed at runtime
+/// with `invalid type: integer 4683416, expected a string` for an App ID,
+/// which is a string to GitHub and to this crate's own struct, and a number
+/// only because it looked like one.
+///
+/// The class is "identifier-shaped input": App IDs, installation IDs, run
+/// IDs, issue numbers, ports. Every one of them is text that must survive
+/// as text, and every one of them will trip the same wire. So the fix is a
+/// reusable deserializer rather than a per-action workaround — the second
+/// action to need it should find it here, not rediscover it.
+pub mod de {
+    use serde::{Deserialize, Deserializer};
+
+    /// Accept a JSON string OR a number, yielding a `String` either way.
+    ///
+    /// # Errors
+    /// Returns the underlying deserializer error for any other type — a
+    /// bool, array or object here is a genuine mistake, not a shape to
+    /// coerce.
+    pub fn string_or_number<'de, D>(d: D) -> Result<String, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            S(String),
+            I(i64),
+            F(f64),
+        }
+        Ok(match Either::deserialize(d)? {
+            Either::S(s) => s,
+            Either::I(i) => i.to_string(),
+            // A float here means the input had a decimal point. Rendering it
+            // back through Display rather than a fixed precision keeps
+            // "1.5" as "1.5" instead of "1.50000".
+            Either::F(f) => f.to_string(),
+        })
+    }
+
+    /// The `Option` form, for an input that is genuinely optional.
+    ///
+    /// # Errors
+    /// As [`string_or_number`].
+    pub fn opt_string_or_number<'de, D>(d: D) -> Result<Option<String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            S(String),
+            I(i64),
+            F(f64),
+        }
+        Ok(Option::<Either>::deserialize(d)?.map(|e| match e {
+            Either::S(s) => s,
+            Either::I(i) => i.to_string(),
+            Either::F(f) => f.to_string(),
+        }))
+    }
+}
+
+#[cfg(test)]
+mod identifier_shaped_input_tests {
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct Ids {
+        #[serde(deserialize_with = "de::string_or_number")]
+        app_id: String,
+        #[serde(default, deserialize_with = "de::opt_string_or_number")]
+        run_id: Option<String>,
+    }
+
+    #[test]
+    fn an_all_digits_input_survives_as_text() {
+        // ★ THE REGRESSION. Without the deserializer this is
+        // "invalid type: integer 4683416, expected a string" at RUNTIME —
+        // after the action has already been built, published and consumed.
+        let env = MapEnv::new().with("APP_ID", "4683416");
+        let got: Ids = Input::from_env_with(&env).expect("digits must parse as text");
+        assert_eq!(got.app_id, "4683416");
+        assert_eq!(got.run_id, None);
+    }
+
+    #[test]
+    fn a_normal_string_is_unaffected() {
+        let env = MapEnv::new().with("APP_ID", "app-4683416");
+        let got: Ids = Input::from_env_with(&env).expect("plain text still parses");
+        assert_eq!(got.app_id, "app-4683416");
+    }
+
+    #[test]
+    fn a_leading_zero_identifier_is_not_silently_renumbered() {
+        // "0042" parses as i64 42 and would come back as "42" — a DIFFERENT
+        // identifier. parse_scalar leaves it a string precisely because it is
+        // not canonical decimal, and this pins that so a future "smarter"
+        // number parser cannot quietly break padded ids.
+        let env = MapEnv::new().with("APP_ID", "0042");
+        let got: Ids = Input::from_env_with(&env).expect("padded id parses");
+        assert_eq!(got.app_id, "0042", "a padded identifier must not be renumbered");
+    }
+
+    #[test]
+    fn an_optional_identifier_round_trips_both_shapes() {
+        let env = MapEnv::new()
+            .with("APP_ID", "1")
+            .with("RUN_ID", "99887766");
+        let got: Ids = Input::from_env_with(&env).expect("both present");
+        assert_eq!(got.run_id.as_deref(), Some("99887766"));
     }
 }
