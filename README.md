@@ -5,10 +5,6 @@ published pleme-io action's Rust binary depends on this crate.
 
 **Companion to** the typescape's `Action` domain at
 [`pleme-io/arch-synthesizer/src/action_domain/`](https://github.com/pleme-io/arch-synthesizer/tree/main/src/action_domain).
-**Canonical design** at
-[`pleme-io/theory/CONSTRUCTIVE-ACTIONS.md`](https://github.com/pleme-io/theory/blob/main/CONSTRUCTIVE-ACTIONS.md).
-**Implementation plan** at
-[`pleme-io/theory/PLEME-ACTIONS-PLAN.md`](https://github.com/pleme-io/theory/blob/main/PLEME-ACTIONS-PLAN.md).
 
 ## What it provides
 
